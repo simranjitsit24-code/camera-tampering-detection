@@ -18,98 +18,118 @@ A single reference (baseline) frame is captured once, and every subsequent frame
 compared against it — the baseline is never replaced by a "tampered" frame, so a
 sustained tamper event doesn't get normalized into the new "normal" over time.
 
-Two independent signals are computed per frame:
+# Camera Tampering Detector
 
-| Signal | Method | Catches |
-|---|---|---|
-| Structural correlation | Grid of patch-level `matchTemplate` (TM_CCOEFF_NORMED) against baseline | Reframing, pan/tilt, physical repositioning |
-| Color/tone similarity | HSV histogram cosine similarity | Blackout, whiteout, gross lighting change |
+Real-time webcam tamper detection using classical computer vision. The detector
+compares each frame with a reference view and identifies camera movement, a changed
+view, a covered lens, defocus, blackout, and whiteout. It does not use a machine
+learning model, training data, or a GPU.
 
-These are treated as **independent triggers**, not an AND condition — in low
-color-diversity scenes (e.g. grayscale/metal environments), histogram similarity can
-stay high through a full reframe since the color *mix* doesn't change even though the
-spatial layout does. Gating on both simultaneously misses real movement events.
+## Requirements
 
-Once a frame looks suspicious, it's sub-classified:
+- Python 3
+- OpenCV
+- NumPy
 
-- **`camera_moved`** — structural mismatch, texture/focus otherwise normal
-- **`defocus`** — Laplacian focus-measure has collapsed relative to baseline
-- **`blocked_view`** — grayscale std-dev has collapsed (near-uniform frame, e.g. covered lens)
-- **`black_frame` / `white_frame`** — luminance threshold + histogram deviation
-
-Day/night (IR) transitions are detected separately (B/G channel divergence) and
-handled as a legitimate re-baseline trigger, not a tamper event.
-
-Every tamper class requires **N consecutive suspicious frames** (configurable) before
-firing, to suppress single-frame false positives from motion blur, a person briefly
-crossing the FOV, or transient noise.
-
-## Tech stack
-
-- **OpenCV** — does all the heavy lifting, no other CV library involved:
-  - `cv2.matchTemplate` (`TM_CCOEFF_NORMED`) — grid patch correlation
-  - `cv2.calcHist` / `cv2.normalize` — HSV histogram + cosine similarity
-  - `cv2.Laplacian` — focus-measure (defocus detection)
-  - `cv2.cvtColor`, `cv2.VideoCapture`, `cv2.VideoWriter` — color conversion and I/O
-- **NumPy** — array ops, thresholds, cosine similarity
-- **Python 3** — no other runtime dependencies
-
-No ML model, no training data, no GPU requirement — runs on CPU in real time per stream.
-
-## Installation
+Install the dependencies with:
 
 ```bash
 pip install opencv-python numpy
 ```
 
-## Usage
+## Run
 
-```python
-from camera_tamper_detector import CameraTamperDetector
-
-detector = CameraTamperDetector(output_dir="tamper_frames", tamper_confirm_frames=5)
-
-result = detector.process_frame(bgr_frame)  # np.ndarray, BGR, HxWx3
-if result["tampered"]:
-    print(result["note"])          # e.g. "camera_moved_confirmed"
-    print(result["frame"])         # annotated frame (only drawn when tampered)
-```
-
-Run against a video file directly:
+From the repository directory, start the webcam detector with:
 
 ```bash
-python CameraTamperingDetector_fresh.py
+python CameraTamperingDetector.py
 ```
 
-writes an annotated `output_inference.mp4` (tampered frames get a red banner,
-normal frames pass through untouched) and saves confirmed tamper frames to
-`tamper_frames/tampered/`.
+The program opens webcam device `0` at 640x480 and displays the live feed in a
+window named `Camera Tamper Detection`. It first waits 45 frames for automatic
+exposure, white balance, and focus to settle, then captures the current frame as the
+baseline. Confirmed tamper frames are written to `tamper_frames/` as JPEG files,
+with at most one saved image every three seconds.
+
+Controls:
+
+- Press `B` to replace the baseline with the current frame.
+- Press `Q` to quit.
+
+The program prints the total number of processed frames and confirmed tamper events
+when it exits. On Windows, it tries the DirectShow capture backend first and falls
+back to the default OpenCV backend if necessary.
+
+## Detection
+
+The baseline is retained until it is explicitly reset with `B` or through
+`set_baseline()`. Each subsequent frame is evaluated using independent signals:
+
+| Signal | Method | Detects |
+|---|---|---|
+| Scene similarity | HSV histogram cosine similarity | Large changes in the scene or lighting |
+| Camera movement | ORB feature matching and median keypoint shift | Physical movement or reframing |
+| View change | Blurred-frame difference and insufficient ORB matches | A camera pointed at a substantially different view |
+| Blocked view | Grayscale mean and standard deviation | A covered or nearly uniform lens |
+| Defocus | Laplacian variance relative to the baseline | Loss of focus |
+| Blackout/whiteout | Grayscale mean plus histogram deviation | Very dark or very bright frames |
+
+Suspicious frames must remain consecutive before an alert is confirmed. This avoids
+triggering on a single blurred frame or a person briefly crossing the view. A
+confirmed frame receives a red `TAMPER DETECTED` banner in the display and saved
+image.
+
+## Python API
+
+Frames passed to `process_frame()` must be OpenCV BGR NumPy arrays with shape
+`HxWx3`.
+
+```python
+import cv2
+from CameraTamperingDetector import CameraTamperDetector
+
+detector = CameraTamperDetector(
+    tamper_confirm_frames=60,
+    output_dir="tamper_frames",
+)
+
+result = detector.process_frame(bgr_frame)
+if result["tampered"]:
+    print(result["note"])
+    annotated_frame = result["frame"]
+```
+
+`process_frame()` returns a dictionary containing `tampered`, `note`, and the
+processed `frame`. For non-empty frames after baseline setup it also includes
+`similarity`, `changed_ratio`, and `lap_ratio`. Empty frames return
+`{"tampered": False, "note": "empty_frame"}`.
+
+Call `set_baseline(frame)` when the intended scene changes. The output directory is
+created automatically.
 
 ## Configuration
 
 | Parameter | Default | Purpose |
-|---|---|---|
-| `grid_size` | 100 |   Number of patch points for structural correlation (10×10 grid; patch/cell size auto-scales to the input frame's resolution, not a fixed pixel size) |
-| `match_threshold` | 0.65 | Per-patch correlation cutoff to count as "matched" |
-| `index_threshold` | 20 | Max matched-patch count still considered suspicious |
-| `similarity_threshold` | 0.7 | Max histogram cosine similarity still considered suspicious |
-| `covered_std_threshold` | 15.0 | Grayscale std-dev below which a frame is "blocked/covered" |
-| `defocus_ratio_threshold` | 0.5 | Focus-measure ratio (current/baseline) below which a frame is "defocused" |
-| `tamper_confirm_frames` | 5 | Consecutive suspicious frames required to confirm movement/defocus/blocked-view |
-| `black_white_confirm_frames` | 10 | Consecutive suspicious frames required to confirm blackout/whiteout |
-| `ir_change_confirm_frames` | 5 | Consecutive frames required to confirm a day/night switch and re-baseline |
+|---|---:|---|
+| `similarity_threshold` | `0.70` | Histogram similarity below this can indicate a blocked view |
+| `black_mean_threshold` | `35` | Mean grayscale value below which a frame can be black |
+| `white_mean_threshold` | `220` | Mean grayscale value above which a frame can be white |
+| `covered_std_threshold` | `15.0` | Grayscale standard deviation below which a view can be covered |
+| `defocus_ratio_threshold` | `0.20` | Current-to-baseline Laplacian variance ratio for defocus |
+| `defocus_similarity_max` | `0.65` | Histogram similarity ceiling for defocus detection |
+| `tamper_confirm_frames` | `60` | Consecutive frames needed for movement, defocus, or blocked-view confirmation |
+| `black_white_confirm_frames` | `45` | Consecutive frames needed for blackout/whiteout confirmation |
+| `warmup_frames` | `45` | Frames to skip before setting the initial baseline |
+| `shift_threshold_px` | `45` | Median ORB keypoint shift needed to classify camera movement |
+| `view_changed_ratio` | `0.60` | Blurred-pixel change ratio used for a substantially changed view |
+| `output_dir` | `tamper_frames` | Directory for saved confirmed tamper images |
 
-## Known limitations
+## Limitations
 
-- Small-translation shake/vibration degrades gracefully rather than triggering
-  cleanly — structural patch correlation is tuned for clear reframes, not
-  sub-pixel jitter.
-- HSV histogram similarity is a weak signal in low color-diversity environments;
-  the structural signal carries most of the detection weight there by design.
-- No re-baseline mechanism for legitimate scene changes other than day/night
-  switching (e.g. permanent furniture rearrangement) — call `set_baseline()`
-  manually if the "true" scene changes on purpose.
-
-## License
-
-[choose a license]
+- The current entry point uses webcam device `0`; video-file processing is not
+  implemented in `main()`.
+- A legitimate permanent scene change should be followed by a manual baseline reset.
+- Detection depends on having enough textured features for ORB matching; low-texture
+  scenes rely more heavily on the histogram and frame-difference signals.
+- The confirmation defaults are tuned for roughly 30 FPS, so alerts can take about
+  two seconds for general tamper and 1.5 seconds for blackout/whiteout.
