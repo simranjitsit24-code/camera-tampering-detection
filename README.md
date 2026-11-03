@@ -1,8 +1,9 @@
-# Camera Tamper Detection
+# Camera Tampering Detector
 
-Real-time detection of camera tampering — movement/reframing, defocus, blocked/covered
-lens, and blackout/whiteout — from a live video stream or file, using classical CV
-signals (no ML model, no training data required).
+Real-time webcam tamper detection using classical computer vision. The detector
+compares each frame with a reference view and identifies camera movement, a changed
+view, a covered lens, defocus, blackout, and whiteout. It does not use a machine
+learning model, training data, or a GPU.
 
 ## Why
 
@@ -11,19 +12,6 @@ feed reflects the intended scene. A moved, covered, or defocused camera silently
 breaks that assumption while continuing to produce output. This detector runs
 upstream of those pipelines and raises an explicit tamper flag when the assumption
 no longer holds.
-
-## Detection approach
-
-A single reference (baseline) frame is captured once, and every subsequent frame is
-compared against it — the baseline is never replaced by a "tampered" frame, so a
-sustained tamper event doesn't get normalized into the new "normal" over time.
-
-# Camera Tampering Detector
-
-Real-time webcam tamper detection using classical computer vision. The detector
-compares each frame with a reference view and identifies camera movement, a changed
-view, a covered lens, defocus, blackout, and whiteout. It does not use a machine
-learning model, training data, or a GPU.
 
 ## Requirements
 
@@ -63,16 +51,19 @@ back to the default OpenCV backend if necessary.
 ## Detection
 
 The baseline is retained until it is explicitly reset with `B` or through
-`set_baseline()`. Each subsequent frame is evaluated using independent signals:
+`set_baseline()`. It is never replaced by a tampered frame, so a sustained tamper
+event does not become the new "normal". Each subsequent frame is evaluated with the
+signals below. Histogram similarity is a supporting signal used inside several of the
+checks rather than a stand-alone trigger.
 
 | Signal | Method | Detects |
 |---|---|---|
-| Scene similarity | HSV histogram cosine similarity | Large changes in the scene or lighting |
+| Scene similarity | HSV histogram cosine similarity | Supports the checks below; large changes in scene or lighting |
 | Camera movement | ORB feature matching and median keypoint shift | Physical movement or reframing |
-| View change | Blurred-frame difference and insufficient ORB matches | A camera pointed at a substantially different view |
-| Blocked view | Grayscale mean and standard deviation | A covered or nearly uniform lens |
-| Defocus | Laplacian variance relative to the baseline | Loss of focus |
-| Blackout/whiteout | Grayscale mean plus histogram deviation | Very dark or very bright frames |
+| View change | Blurred-frame difference, too few ORB matches, and low histogram similarity | A camera pointed at a substantially different view |
+| Blocked view | Grayscale standard deviation and histogram similarity | A covered or nearly uniform lens |
+| Defocus | Laplacian variance relative to the baseline, and histogram similarity | Loss of focus |
+| Blackout/whiteout | Grayscale mean and histogram similarity | Very dark or very bright frames |
 
 Suspicious frames must remain consecutive before an alert is confirmed. This avoids
 triggering on a single blurred frame or a person briefly crossing the view. A
@@ -85,7 +76,6 @@ Frames passed to `process_frame()` must be OpenCV BGR NumPy arrays with shape
 `HxWx3`.
 
 ```python
-import cv2
 from CameraTamperingDetector import CameraTamperDetector
 
 detector = CameraTamperDetector(
@@ -99,10 +89,10 @@ if result["tampered"]:
     annotated_frame = result["frame"]
 ```
 
-`process_frame()` returns a dictionary containing `tampered`, `note`, and the
-processed `frame`. For non-empty frames after baseline setup it also includes
-`similarity`, `changed_ratio`, and `lap_ratio`. Empty frames return
-`{"tampered": False, "note": "empty_frame"}`.
+`process_frame()` returns a dictionary containing `tampered`, `note`, and `frame`.
+For non-empty frames after baseline setup it also includes `similarity`,
+`changed_ratio`, and `lap_ratio`. During warm-up the note is `warming_up`, and empty
+frames return the note `empty_frame`.
 
 Call `set_baseline(frame)` when the intended scene changes. The output directory is
 created automatically.
@@ -117,19 +107,27 @@ created automatically.
 | `covered_std_threshold` | `15.0` | Grayscale standard deviation below which a view can be covered |
 | `defocus_ratio_threshold` | `0.20` | Current-to-baseline Laplacian variance ratio for defocus |
 | `defocus_similarity_max` | `0.65` | Histogram similarity ceiling for defocus detection |
-| `tamper_confirm_frames` | `60` | Consecutive frames needed for movement, defocus, or blocked-view confirmation |
-| `black_white_confirm_frames` | `45` | Consecutive frames needed for blackout/whiteout confirmation |
+| `tamper_confirm_frames` | `60` | Consecutive suspicious frames needed to confirm any tamper alert |
+| `black_white_confirm_frames` | `45` | Consecutive dark or bright frames before a black/white frame counts as suspicious |
 | `warmup_frames` | `45` | Frames to skip before setting the initial baseline |
 | `shift_threshold_px` | `45` | Median ORB keypoint shift needed to classify camera movement |
-| `view_changed_ratio` | `0.60` | Blurred-pixel change ratio used for a substantially changed view |
+| `view_changed_ratio` | `0.60` | Fraction of changed pixels used for a substantially changed view |
 | `output_dir` | `tamper_frames` | Directory for saved confirmed tamper images |
+
+The following values are fixed in the code: histogram similarity below `0.60` for
+black/white frames and below `0.40` for a changed view, a per-pixel change cutoff of
+`40`, a minimum of `10` good ORB matches, and a ratio-test value of `0.75`.
 
 ## Limitations
 
 - The current entry point uses webcam device `0`; video-file processing is not
   implemented in `main()`.
+- Alerts are shown on screen, printed to the console, and saved as images. There is
+  no external notification yet.
 - A legitimate permanent scene change should be followed by a manual baseline reset.
 - Detection depends on having enough textured features for ORB matching; low-texture
   scenes rely more heavily on the histogram and frame-difference signals.
-- The confirmation defaults are tuned for roughly 30 FPS, so alerts can take about
-  two seconds for general tamper and 1.5 seconds for blackout/whiteout.
+- The confirmation defaults are tuned for roughly 30 FPS. A general tamper alert
+  takes about two seconds (60 frames). Blackout and whiteout take about 3.5 seconds,
+  because a frame must first be dark or bright for 45 frames and then the general
+  60-frame confirmation applies (about 105 frames).
